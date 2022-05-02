@@ -1,17 +1,15 @@
 local NUM_GPUS = 1;
-local NUM_THREADS = 1;
+local NUM_GRAD_ACC = 4;
+local BATCH_SIZE = 512 / NUM_GPUS / NUM_GRAD_ACC;
 
 local BASE_READER = {
         "type": "simple_language_modeling",
         "tokenizer": {
-          "type": "word",
-          "word_splitter": {
 	        // The 1 Billion Word Language Model Benchmark dataset is
 	        // pre-tokenized. (Also, if you're running against a untokenized
 	        // dataset be aware that there are serialization issues with Spacy.
 	        // These come into play in the multiprocess case.)
-            "type": "just_spaces"
-          }
+          "type": "just_spaces"
         },
         "token_indexers": {
           "tokens": {
@@ -23,26 +21,21 @@ local BASE_READER = {
         },
         "max_sequence_length": 400,
         "start_tokens": ["<S>"],
-        "end_tokens": ["</S>"]
+        "end_tokens": ["</S>"],
 };
 
-local BASE_ITERATOR = {
-  "type": "bucket",
-  "max_instances_in_memory": 16384 * NUM_GPUS,
-  // Larger than we really desire for a batch. Since we set
-  // maximum_samples_per_batch below we will pack approximately that many
-  // samples in every batch.
-  "batch_size": 512 * NUM_GPUS,
-  "sorting_keys": [["source", "num_tokens"]],
-  "maximum_samples_per_batch": ["num_tokens", 2000]
+local BASE_LOADER = {
+  "max_instances_in_memory": BATCH_SIZE * 100,
+  "batch_sampler": {
+    "type": "bucket",
+    "batch_size": BATCH_SIZE,
+  }
 };
 
 {
   "dataset_reader": {
-    "type": "multiprocess",
+    "type": "sharded",
     "base_reader": BASE_READER,
-    "num_workers": NUM_THREADS,
-    "output_queue_size": 1000
   },
   // Note: We don't set a validation_data_path because the softmax is only
   // sampled during training. Not sampling on GPUs results in a certain OOM
@@ -52,7 +45,8 @@ local BASE_ITERATOR = {
 
   "vocabulary": {
       // Use a prespecified vocabulary for efficiency.
-      "directory_path": "data/tokens.txt"
+      "type": "from_files",
+      "directory": std.extVar("BIDIRECTIONAL_LM_VOCAB_PATH"),
       // Plausible config for generating the vocabulary.
       // "tokens_to_add": {
       //     "tokens": ["<S>", "</S>"],
@@ -64,11 +58,13 @@ local BASE_ITERATOR = {
     "type": "language_model",
     "bidirectional": true,
     "num_samples": 8192,
-    "sparse_embeddings": true,
+    # Sparse embeddings don't work with DistributedDataParallel.
+    "sparse_embeddings": false,
     "text_field_embedder": {
-      // Note: This is because we only use the token_characters during embedding, not the tokens themselves.
-      "allow_unmatched_keys": true,
       "token_embedders": {
+        "tokens": {
+          "type": "empty"
+        },
         "token_characters": {
             "type": "character_encoding",
             "embedding": {
@@ -110,20 +106,12 @@ local BASE_ITERATOR = {
         "input_dropout": 0.1
     }
   },
-  "iterator": {
-    "type": "multiprocess",
-    "base_iterator": BASE_ITERATOR,
-    "num_workers": NUM_THREADS,
-    // The multiprocess dataset reader and iterator use many file descriptors,
-    // so we need to increase the ulimit depending on the size of this queue.
-    // See https://pytorch.org/docs/stable/multiprocessing.html#file-descriptor-file-descriptor
-    // for a description of the underlying issue. `ulimit -n 8192` has sufficed,
-    // but that number could use tuning.
-    "output_queue_size": 500
+  "data_loader": BASE_LOADER,
+  "distributed": {
+    "cuda_devices": if NUM_GPUS > 1 then std.range(0, NUM_GPUS - 1) else 0,
   },
   "trainer": {
-    "num_epochs": 4,
-    "cuda_device" : if NUM_GPUS > 1 then std.range(0, NUM_GPUS - 1) else 0,
+    "num_epochs": 10,
     "optimizer": {
       // The gradient accumulators in Adam for the running stdev and mean for
       // words not used in the sampled softmax would be decayed to zero with the
@@ -140,6 +128,7 @@ local BASE_ITERATOR = {
       // Adjusted based on our sample size relative to Calypso's.
       "warmup_steps": 6000
     },
-    "should_log_learning_rate": true
+    "num_gradient_accumulation_steps": NUM_GRAD_ACC,
+    "use_amp": true
   }
 }
